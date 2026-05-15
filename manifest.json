@@ -1,12 +1,12 @@
 {
-    "display_name": "Cache Refresh",
-    "loading_order": 1,
+    "display_name": "Cache Refresher",
+    "loading_order": 10,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "styles.css",
-    "author": "OneinfinityN7",
-    "version": "1.0.1",
-    "homePage": "https://github.com/OneinfinityN7/Cache-Refresh-SillyTavern",
+    "author": "bbw3000",
+    "version": "1.2.0",
+    "homePage": "https://github.com/bbw3000/Cache-Refresh-SillyTavern",
     "auto_update": true
 }

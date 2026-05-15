@@ -2,101 +2,11 @@
  * Cache Refresher Extension for SillyTavern
  *
  * This extension automatically keeps the language model's cache "warm" by sending
- * periodic minimal requests to prevent cache expiration. This helps reduce API costs.
+ * periodic minimal requests, then truncating streamed responses early to reduce API costs.
  */
 
 import { extension_settings } from '../../../extensions.js';
-const { chatCompletionSettings, eventSource, eventTypes, renderExtensionTemplateAsync, mainApi, sendGenerationRequest } = SillyTavern.getContext();
-
-// Stolen from script.js and modify to work for the extension.
-class TempResponseLength {
-    static #originalResponseLength = -1;
-    static #lastApi = null;
-
-    static isCustomized() {
-        return this.#originalResponseLength > -1;
-    }
-
-    /**
-     * Save the current response length for the specified API.
-     * @param {string} api API identifier
-     * @param {number} responseLength New response length
-     */
-    static save(api, responseLength) {
-        if (api === 'openai') {
-            this.#originalResponseLength = chatCompletionSettings.openai_max_tokens;
-            chatCompletionSettings.openai_max_tokens = responseLength;
-        } else {
-            throw new Error(`Unsupported API in class TempResponseLength: save(api, responseLength)`);
-        }
-
-        this.#lastApi = api;
-        console.log('[TempResponseLength] Saved original response length:', TempResponseLength.#originalResponseLength);
-    }
-
-    /**
-     * Restore the original response length for the specified API.
-     * @param {string|null} api API identifier
-     * @returns {void}
-     */
-    static restore(api) {
-        if (this.#originalResponseLength === -1) {
-            return;
-        }
-        if (!api && this.#lastApi) {
-            api = this.#lastApi;
-        }
-        if (api === 'openai') {
-            chatCompletionSettings.openai_max_tokens = this.#originalResponseLength;
-        } else {
-            throw new Error(`Unsupported API in class TempResponseLength: restore(api)`);
-        }
-
-        console.log('[TempResponseLength] Restored original response length:', this.#originalResponseLength);
-        this.#originalResponseLength = -1;
-        this.#lastApi = null;
-    }
-
-    /**
-     * Sets up an event hook to restore the original response length when the event is emitted.
-     * @param {string} api API identifier
-     * @returns {function(): void} Event hook function
-     */
-    static setupEventHook(api) {
-        const eventHook = () => {
-            if (this.isCustomized()) {
-                this.restore(api);
-            }
-        };
-
-        switch (api) {
-            case 'openai':
-                eventSource.once(eventTypes.CHAT_COMPLETION_SETTINGS_READY, eventHook);
-                break;
-            default:
-                eventSource.once(eventTypes.GENERATE_AFTER_DATA, eventHook);
-                break;
-        }
-
-        return eventHook;
-    }
-
-    /**
-     * Removes the event hook for the specified API.
-     * @param {string} api API identifier
-     * @param {function(): void} eventHook Previously set up event hook
-     */
-    static removeEventHook(api, eventHook) {
-        switch (api) {
-            case 'openai':
-                eventSource.removeListener(eventTypes.CHAT_COMPLETION_SETTINGS_READY, eventHook);
-                break;
-            default:
-                eventSource.removeListener(eventTypes.GENERATE_AFTER_DATA, eventHook);
-                break;
-        }
-    }
-}
+const { chatCompletionSettings, eventSource, eventTypes, renderExtensionTemplateAsync, getRequestHeaders, saveSettingsDebounced } = SillyTavern.getContext();
 
 // Log extension loading attempt
 console.log('Cache Refresher: Loading extension...');
@@ -115,6 +25,9 @@ const defaultSettings = {
     showNotifications: true,               // Whether to display toast notifications for each refresh
     showStatusIndicator: true,             // Whether to display the floating status indicator
     disableMaxTokens: false,               // Whether to disable the max tokens feature (enable for problematic providers)
+    truncateStream: true,                  // Whether to cut off the streaming refresh request early
+    statusWidgetPosition: null,           // Persisted floating widget position
+    refreshMessage: 'STOP roleplay.\nNow you must simply reply "API OK".\nOverthinking or reasoning is banned to prevent wasting tokens.',
 };
 
 // Initialize extension settings
@@ -138,6 +51,241 @@ let refreshInProgress = false;   // Flag to prevent concurrent refreshes
 let statusIndicator = null;      // DOM element for the floating status indicator
 let nextRefreshTime = null;      // Timestamp for the next scheduled refresh
 let statusUpdateInterval = null; // Interval for updating the countdown timer
+let statusDragState = null;      // Pointer drag state for the floating widget
+
+function cloneChatData(chat) {
+    if (typeof structuredClone === 'function') {
+        return structuredClone(chat);
+    }
+
+    return JSON.parse(JSON.stringify(chat));
+}
+
+function saveStatusWidgetPosition(left, top) {
+    settings.statusWidgetPosition = { left, top };
+    void saveSettings();
+}
+
+function applyStatusWidgetPosition() {
+    if (!statusIndicator) return;
+
+    const pos = settings.statusWidgetPosition;
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+        statusIndicator.style.left = `${Math.round(pos.left)}px`;
+        statusIndicator.style.top = `${Math.round(pos.top)}px`;
+        statusIndicator.style.right = 'auto';
+        statusIndicator.style.bottom = 'auto';
+    } else {
+        statusIndicator.style.left = 'auto';
+        statusIndicator.style.top = 'auto';
+        statusIndicator.style.right = '10px';
+        statusIndicator.style.bottom = '10px';
+    }
+}
+
+function setStatusWidgetTheme(mode) {
+    if (!statusIndicator) return;
+    statusIndicator.dataset.state = mode;
+}
+
+function getCountdownParts(intervalMs) {
+    const safeMs = Math.max(0, Number(intervalMs) || 0);
+    const minutes = Math.floor(safeMs / 60000);
+    const seconds = Math.floor((safeMs % 60000) / 1000);
+    return { minutes, seconds };
+}
+
+function bindStatusWidgetEvents() {
+    if (!statusIndicator || statusIndicator.dataset.bound === '1') return;
+
+    const switchBtn = statusIndicator.querySelector('.cache_refresher_switch');
+
+    switchBtn?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        $('#cache_refresher_enabled').prop('checked', !settings.enabled).trigger('change');
+    });
+
+    statusIndicator.addEventListener('pointerdown', (event) => {
+        if (event.target.closest('.cache_refresher_switch') || event.target.closest('button,input,label,a,textarea,select')) {
+            return;
+        }
+
+        const rect = statusIndicator.getBoundingClientRect();
+        statusIndicator.style.width = `${Math.round(rect.width)}px`;
+        statusDragState = {
+            pointerId: event.pointerId,
+            offsetX: event.clientX - rect.left,
+            offsetY: event.clientY - rect.top,
+        };
+
+        statusIndicator.classList.add('is-dragging');
+        statusIndicator.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+    });
+
+    statusIndicator.addEventListener('pointermove', (event) => {
+        if (!statusDragState || statusDragState.pointerId !== event.pointerId) return;
+
+        const width = statusIndicator.offsetWidth || 260;
+        const height = statusIndicator.offsetHeight || 52;
+        const left = Math.max(0, Math.min(window.innerWidth - width, event.clientX - statusDragState.offsetX));
+        const top = Math.max(0, Math.min(window.innerHeight - height, event.clientY - statusDragState.offsetY));
+
+        statusIndicator.style.left = `${Math.round(left)}px`;
+        statusIndicator.style.top = `${Math.round(top)}px`;
+        statusIndicator.style.right = 'auto';
+        statusIndicator.style.bottom = 'auto';
+    });
+
+    const endDrag = (event) => {
+        if (!statusDragState || statusDragState.pointerId !== event.pointerId) return;
+        statusDragState = null;
+        statusIndicator.classList.remove('is-dragging');
+        const left = parseFloat(statusIndicator.style.left || '0') || 0;
+        const top = parseFloat(statusIndicator.style.top || '0') || 0;
+        saveStatusWidgetPosition(left, top);
+        statusIndicator.style.width = '';
+    };
+
+    statusIndicator.addEventListener('pointerup', endDrag);
+    statusIndicator.addEventListener('pointercancel', endDrag);
+
+    statusIndicator.dataset.bound = '1';
+}
+
+const supportedChatCompletionSources = new Set(['openai', 'custom', 'claude', 'makersuite']);
+
+function getCurrentChatCompletionSource() {
+    const source = String(chatCompletionSettings?.chat_completion_source || 'openai');
+    return supportedChatCompletionSources.has(source) ? source : null;
+}
+
+function getCurrentChatCompletionModel(source = getCurrentChatCompletionSource()) {
+    switch (source) {
+        case 'claude':
+            return chatCompletionSettings?.claude_model || '';
+        case 'makersuite':
+            return chatCompletionSettings?.google_model || '';
+        case 'custom':
+            return chatCompletionSettings?.custom_model || '';
+        case 'openai':
+            return chatCompletionSettings?.openai_model || '';
+        default:
+            return '';
+    }
+}
+
+function buildRefreshMessages() {
+    const prompt = cloneChatData(lastGenerationData.prompt);
+    const refreshMessage = (settings.refreshMessage || defaultSettings.refreshMessage).trim();
+
+    if (!Array.isArray(prompt) || !prompt.length) {
+        return [{ role: 'user', content: refreshMessage }];
+    }
+
+    const lastIndex = prompt.length - 1;
+    const lastMessage = prompt[lastIndex];
+
+    if (lastMessage && typeof lastMessage === 'object') {
+        const updatedMessage = { ...lastMessage };
+        if ('content' in updatedMessage) updatedMessage.content = refreshMessage;
+        if ('mes' in updatedMessage) updatedMessage.mes = refreshMessage;
+        if ('text' in updatedMessage) updatedMessage.text = refreshMessage;
+        if ('message' in updatedMessage) updatedMessage.message = refreshMessage;
+        prompt[lastIndex] = updatedMessage;
+    } else {
+        prompt[lastIndex] = { role: 'user', content: refreshMessage };
+    }
+
+    return prompt;
+}
+
+function buildRefreshRequestBody(stream) {
+    const source = getCurrentChatCompletionSource();
+    const model = getCurrentChatCompletionModel(source);
+
+    if (!source || !model) {
+        throw new Error(`Unsupported chat completion source: ${chatCompletionSettings?.chat_completion_source || 'unknown'}`);
+    }
+
+    const maxTokens = settings.disableMaxTokens
+        ? Number(chatCompletionSettings?.openai_max_tokens || settings.maxTokens || 1)
+        : Number(settings.maxTokens || 1);
+
+    const body = {
+        chat_completion_source: source,
+        model,
+        messages: buildRefreshMessages(),
+        stream: !!stream,
+        max_tokens: maxTokens,
+        max_completion_tokens: maxTokens,
+        temperature: Number(chatCompletionSettings?.temp_openai ?? 1),
+        top_p: Number(chatCompletionSettings?.top_p_openai ?? 1),
+        presence_penalty: Number(chatCompletionSettings?.pres_pen_openai ?? 0),
+        frequency_penalty: Number(chatCompletionSettings?.freq_pen_openai ?? 0),
+    };
+
+    if (source === 'openai' || source === 'claude' || source === 'makersuite') {
+        body.reverse_proxy = String(chatCompletionSettings?.reverse_proxy || '');
+        body.proxy_password = String(chatCompletionSettings?.proxy_password || '');
+    }
+
+    if (source === 'custom') {
+        body.custom_url = String(chatCompletionSettings?.custom_url || '');
+        body.custom_include_body = String(chatCompletionSettings?.custom_include_body || '');
+        body.custom_exclude_body = String(chatCompletionSettings?.custom_exclude_body || '');
+        body.custom_include_headers = String(chatCompletionSettings?.custom_include_headers || '');
+    }
+
+    if (source === 'claude') {
+        body.use_sysprompt = Boolean(chatCompletionSettings?.use_sysprompt);
+    }
+
+    return body;
+}
+
+async function postRefreshRequest(body, signal) {
+    return await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        cache: 'no-cache',
+        body: JSON.stringify(body),
+        signal,
+    });
+}
+
+async function consumeResponseBody(response, controller, truncateStream) {
+    if (!response.body) {
+        return false;
+    }
+
+    const reader = response.body.getReader();
+
+    try {
+        if (truncateStream) {
+            const { done } = await reader.read();
+            if (!done) {
+                controller.abort();
+                return true;
+            }
+            return false;
+        }
+
+        while (true) {
+            const { done } = await reader.read();
+            if (done) break;
+        }
+    } finally {
+        try {
+            await reader.cancel();
+        } catch (error) {
+            debugLog('Stream reader cancel failed', error);
+        }
+    }
+
+    return false;
+}
 
 /**
  * Logs a message to console with extension prefix for easier debugging
@@ -164,7 +312,7 @@ function showNotification(message, type = 'info') {
  * @returns {boolean} True if using a chat completion API
  */
 function isChatCompletion() {
-    return mainApi === 'openai';
+    return supportedChatCompletionSources.has(String(chatCompletionSettings?.chat_completion_source || 'openai'));
 }
 
 /**
@@ -174,6 +322,7 @@ function isChatCompletion() {
 async function saveSettings() {
     try {
         extension_settings[extensionName] = settings;
+        await saveSettingsDebounced();
         debugLog('Settings saved', settings);
     } catch (error) {
         console.error('Cache Refresher: Error saving settings:', error);
@@ -200,35 +349,72 @@ function updateStatusIndicator() {
     if (!statusIndicator) {
         statusIndicator = document.createElement('div');
         statusIndicator.id = 'cache_refresher_status';
-        statusIndicator.style.position = 'fixed';
-        statusIndicator.style.bottom = '10px';
-        statusIndicator.style.right = '10px';
-        statusIndicator.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
-        statusIndicator.style.color = 'white';
-        statusIndicator.style.padding = '5px 10px';
-        statusIndicator.style.borderRadius = '5px';
-        statusIndicator.style.fontSize = '12px';
-        statusIndicator.style.zIndex = '1000';
-        statusIndicator.style.display = 'none';
+        statusIndicator.className = 'cache_refresher_status_widget';
+        statusIndicator.innerHTML = `
+            <div class="cache_refresher_status_header">
+                <button type="button" class="cache_refresher_switch" aria-label="Toggle Cache Refresher" aria-pressed="false">
+                    <span class="cache_refresher_switch_track"><span class="cache_refresher_switch_thumb"></span></span>
+                </button>
+                <div class="cache_refresher_status_title"></div>
+            </div>
+            <div class="cache_refresher_status_separator"></div>
+            <div class="cache_refresher_status_controls">
+                <div class="cache_refresher_count_block">
+                    <div class="cache_refresher_display_number">
+                        <span class="cache_refresher_count_value"></span>
+                        <span class="cache_refresher_count_suffix">TIMES</span>
+                    </div>
+                </div>
+                <span class="cache_refresher_control_divider">|</span>
+                <div class="cache_refresher_time_block">
+                    <div class="cache_refresher_display_time"><span class="cache_refresher_time_value"></span></div>
+                </div>
+            </div>
+        `;
         document.body.appendChild(statusIndicator);
+        bindStatusWidgetEvents();
+        applyStatusWidgetPosition();
     }
 
-    // Only show the indicator if the extension is active, has refreshes pending, and the indicator is enabled
-    if (settings.enabled && refreshesLeft > 0 && settings.showStatusIndicator) {
-        let timeString = 'calculating...';
+    // Show the indicator whenever the widget is enabled in settings
+    if (settings.showStatusIndicator) {
+        const countdownParts = getCountdownParts(nextRefreshTime ? Math.max(0, nextRefreshTime - Date.now()) : settings.refreshInterval);
 
         if (nextRefreshTime) {
             // Calculate time until next refresh
             const timeRemaining = Math.max(0, nextRefreshTime - Date.now());
 
             // Format time as MM:SS
-            const minutes = Math.floor(timeRemaining / 60000);
-            const seconds = Math.floor((timeRemaining % 60000) / 1000);
-            timeString = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            void timeRemaining;
         }
 
-        statusIndicator.textContent = `Cache refreshes: ${refreshesLeft} remaining (${timeString})`;
-        statusIndicator.style.display = 'block';
+        const titleEl = statusIndicator.querySelector('.cache_refresher_status_title');
+        const countValueEl = statusIndicator.querySelector('.cache_refresher_count_value');
+        const timeValueEl = statusIndicator.querySelector('.cache_refresher_time_value');
+        const switchBtn = statusIndicator.querySelector('.cache_refresher_switch');
+
+        if (switchBtn) {
+            switchBtn.setAttribute('aria-pressed', String(settings.enabled));
+        }
+
+        const text = settings.enabled ? 'Cache Refresher enabled' : 'Cache Refresher disabled';
+        const theme = !settings.enabled ? 'disabled' : (refreshInProgress || (refreshesLeft > 0 && nextRefreshTime) ? 'active' : 'idle');
+
+        if (titleEl) {
+            titleEl.textContent = text;
+        }
+
+        if (countValueEl) {
+            countValueEl.textContent = String(Math.max(0, refreshesLeft)).padStart(2, '0');
+        }
+
+        if (timeValueEl) {
+            const timeDisplay = String(countdownParts.minutes).padStart(2, '0') + ':' + String(countdownParts.seconds).padStart(2, '0');
+            timeValueEl.textContent = timeDisplay;
+        }
+
+        setStatusWidgetTheme(theme);
+        statusIndicator.style.display = 'flex';
 
         // Update the timer display every second for a smooth countdown
         if (!statusUpdateInterval) {
@@ -259,12 +445,14 @@ async function updateSettingsPanel() {
         $('#cache_refresher_show_notifications').prop('checked', settings.showNotifications);
         $('#cache_refresher_show_status_indicator').prop('checked', settings.showStatusIndicator);
         $('#cache_refresher_disable_max_tokens').prop('checked', settings.disableMaxTokens);
+        $('#cache_refresher_truncate_stream').prop('checked', settings.truncateStream);
 
         // Update number inputs with current values
         // Convert milliseconds to minutes for the interval display
         $('#cache_refresher_max_refreshes').val(settings.maxRefreshes);
         $('#cache_refresher_interval').val(settings.refreshInterval / (60 * 1000));
         $('#cache_refresher_max_tokens').val(settings.maxTokens);
+        $('#cache_refresher_refresh_message').val(settings.refreshMessage);
 
         // Enable/disable the max tokens input based on the disableMaxTokens setting
         $('#cache_refresher_max_tokens').prop('disabled', settings.disableMaxTokens);
@@ -329,7 +517,16 @@ async function bindSettingsHandlers() {
         // Show status indicator toggle - controls whether to show the floating status indicator
         $('#cache_refresher_show_status_indicator').off('change').on('change', async function() {
             settings.showStatusIndicator = $(this).prop('checked');
+
+            if (!settings.showStatusIndicator) {
+                settings.enabled = false;
+                stopRefreshCycle();
+                lastGenerationData.prompt = null;
+                refreshesLeft = 0;
+            }
+
             await saveSettings();
+            updateSettingsPanel();
             updateUI(); // Update UI immediately to show/hide the indicator
         });
 
@@ -338,6 +535,12 @@ async function bindSettingsHandlers() {
             settings.disableMaxTokens = $(this).prop('checked');
             await saveSettings();
             updateSettingsPanel(); // Update UI to enable/disable the max tokens input
+        });
+
+        // Truncate stream toggle - stops streamed responses shortly after they start
+        $('#cache_refresher_truncate_stream').off('change').on('change', async function() {
+            settings.truncateStream = $(this).prop('checked');
+            await saveSettings();
         });
 
         // Max refreshes input - controls how many refreshes to perform before stopping
@@ -368,6 +571,12 @@ async function bindSettingsHandlers() {
         // Max tokens input - controls how many tokens to request in each refresh
         $('#cache_refresher_max_tokens').off('change input').on('change input', async function() {
             settings.maxTokens = parseInt($(this).val()) || defaultSettings.maxTokens;
+            await saveSettings();
+        });
+
+        // Refresh message input - controls the fallback message used for cache refreshes
+        $('#cache_refresher_refresh_message').off('change input').on('change input', async function() {
+            settings.refreshMessage = $(this).val() || defaultSettings.refreshMessage;
             await saveSettings();
         });
 
@@ -483,50 +692,61 @@ async function refreshCache() {
     refreshInProgress = true;
     updateUI();
 
-    let eventHook = () => { };
+    let refreshNotice = null;
+    let refreshNoticeType = 'info';
     
     try {
         debugLog('Refreshing cache with data', lastGenerationData);
 
         // Verify we're using a supported API
         if (!isChatCompletion()) {
-            throw new Error(`Unsupported API for cache refresh: ${mainApi} in refreshCache()`);
+            throw new Error(`Unsupported chat completion source for cache refresh: ${chatCompletionSettings?.chat_completion_source || 'unknown'}`);
         }
 
-        // Only use max tokens feature if not disabled in settings
-        if (!settings.disableMaxTokens) {
-            // Temporarily set max tokens to the configured value to minimize token usage
-            TempResponseLength.save(mainApi, settings.maxTokens);
-            eventHook = TempResponseLength.setupEventHook(mainApi);
-            debugLog(`Temporarily set response length to ${settings.maxTokens} token(s)`);
+        const requestBody = buildRefreshRequestBody(true);
+        const controller = new AbortController();
+        const response = await postRefreshRequest(requestBody, controller.signal);
+
+        if (!response.ok) {
+            const errText = await response.text().catch(() => '');
+            throw new Error(`HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}${errText ? `: ${errText}` : ''}`);
+        }
+
+        let streamTruncated = false;
+        if (settings.truncateStream) {
+            streamTruncated = await consumeResponseBody(response, controller, true);
         } else {
-            debugLog('Max tokens feature disabled, using default response length');
+            await response.text().catch(() => '');
         }
-        
-        // Send a "quiet" request - this tells SillyTavern not to display the response
-        // We're just refreshing the cache, not generating visible content
-        const data = await sendGenerationRequest('quiet', lastGenerationData);
-        debugLog('Cache refresh response:', data);
 
-        // Show notification for successful refresh
-        showNotification(`Cache refreshed. ${refreshesLeft - 1} refreshes remaining.`, 'success');
+        if (settings.truncateStream && (streamTruncated || controller.signal.aborted)) {
+            refreshNotice = 'Received stream response and truncated, cache has been refreshed.';
+            refreshNoticeType = 'info';
+        } else {
+            refreshNotice = `Cache refreshed. ${refreshesLeft - 1} refreshes remaining.`;
+            refreshNoticeType = 'success';
+        }
 
     } catch (error) {
-        debugLog('Cache refresh failed', error);
-        showNotification(`Cache refresh failed: ${error.message}`, 'error');
-    } finally {
-        // Always restore the original max tokens value if it was customized
-        if (!settings.disableMaxTokens && TempResponseLength.isCustomized()) {
-            TempResponseLength.restore(mainApi);
-            TempResponseLength.removeEventHook(mainApi, eventHook);
-            debugLog('Restored original response length');
+        if (error?.name === 'AbortError' || /abort/i.test(error?.message || '')) {
+            refreshNotice = 'Received stream response and truncated, cache has been refreshed.';
+            refreshNoticeType = 'info';
+            debugLog('Cache refresh truncated as expected', error);
+        } else {
+            debugLog('Cache refresh failed', error);
+            refreshNotice = `Cache refresh failed: ${error.message}`;
+            refreshNoticeType = 'error';
         }
-        
+    } finally {
         // Always clean up, even if there was an error
         refreshInProgress = false;
         refreshesLeft--;
         updateUI();
         scheduleNextRefresh(); // Schedule the next refresh (or stop if no refreshes left)
+
+        if (refreshNotice) {
+            showNotification(refreshNotice, refreshNoticeType);
+        }
     }
 }
 
@@ -548,7 +768,7 @@ function captureGenerationData(data) {
     }
 
     debugLog('captureGenerationData', data);
-    debugLog('Current API:', mainApi);
+    debugLog('Current source:', chatCompletionSettings?.chat_completion_source);
 
     try {
         // Only support chat completion APIs for now
@@ -565,7 +785,7 @@ function captureGenerationData(data) {
         }
 
         // Store the chat prompt for future refreshes
-        lastGenerationData.prompt = data.chat;
+        lastGenerationData.prompt = cloneChatData(data.chat);
         debugLog('Captured generation data', lastGenerationData);
         //Stop refresh cycle on new prompt (work better than GENERATION_STOPPED event)
         stopRefreshCycle();

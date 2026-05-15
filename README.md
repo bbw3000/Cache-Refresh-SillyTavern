@@ -15,7 +15,8 @@ However, these caches typically have a short lifespan (often just a few minutes)
 *   When you send a message and receive a response, the extension captures the prompt data.
 *   It then schedules a series of refresh requests (up to the maximum number configured).
 *   If a new message is sent, the refresh timer will stop and then restart after the new response is received.
-*   Each refresh request sends a minimal request to the API to just to keep the cache alive.
+*   Each refresh request uses SillyTavern's native chat-completions backend, then truncates the stream early to keep the cache alive with minimal output.
+*   The refresh message can be customized, so the extension does not need to replay the user's last message.
 *   A floating status indicator shows the number of remaining refreshes and a countdown timer, and a notification appear after each succesful refresh.
 *   If you change or leave the conversation, the timer will stop.
 
