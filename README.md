@@ -1,8 +1,12 @@
 # SillyTavern Automatic Cache Refreshing Extension
 
-[![Status](https://img.shields.io/badge/status-ready-green.svg)]()
-
 This extension for [SillyTavern](https://github.com/SillyTavern/SillyTavern) automatically keeps your language model's cache "warm" by sending periodic, minimal requests. While designed primarily for Claude Sonnet, it works with other models as well. By preventing cache expiration, you can significantly reduce API costs.
+
+##bbw3000 fork update
+- Switch to using SillyTavern's native backend to send requests to support all access methods supported by ST.
+- By default, streaming requests + truncation upon receipt of responses are used to achieve the lowest LLM output and avoid the problem of max_tokens being invalid for reasoning content.
+- Refresh message : instead roll the last user message, we now send a short refresh prompt, LLM can now proactively reply with low tokens. This method and max_tokens are used both as a safety net strategy if streaming is not supported.
+- New Timer Panel
 
 ## The Problem: Cache Expiration
 
